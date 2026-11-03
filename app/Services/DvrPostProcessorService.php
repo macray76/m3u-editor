@@ -210,12 +210,18 @@ class DvrPostProcessorService
 
         // ── Step 4: Cleanup local temp dir + proxy broadcast + mark COMPLETED ─
         try {
-            Storage::disk($disk)->deleteDirectory($livePath);
+            $left = $this->deleteTempDirectory($disk, $livePath);
 
-            Log::debug('DVR post-processing step 4: local temp directory cleaned up', [
-                'recording_id' => $recording->id,
-                'live_path' => $livePath,
-            ]);
+            if ($left === 0) {
+                Log::debug('DVR post-processing step 4: local temp directory cleaned up', [
+                    'recording_id' => $recording->id,
+                    'live_path' => $livePath,
+                ]);
+            } else {
+                Log::warning("DVR post-processing step 4: temp dir {$livePath} not fully removed ({$left} entries left, including the directory)", [
+                    'recording_id' => $recording->id,
+                ]);
+            }
         } catch (Exception $e) {
             Log::warning("DVR post-processing step 4: could not delete temp dir {$livePath}: {$e->getMessage()}", [
                 'recording_id' => $recording->id,
@@ -286,6 +292,40 @@ class DvrPostProcessorService
         }
 
         return "library/{$year}/{$title}/{$episode}.{$ext}";
+    }
+
+    /**
+     * Delete a temp directory and everything in it. Returns how many entries are left
+     * (files, sub-directories and the directory itself); 0 only when the directory is gone,
+     * so an empty directory that refuses to go away still counts as incomplete cleanup.
+     *
+     * Storage::deleteDirectory() removes files while it is still iterating the
+     * directory. On SMB/CIFS mounts that iteration skips entries as they disappear,
+     * so roughly one file in six was left behind every time, and with the dvr disk's
+     * 'throw' => false the resulting failure was silently ignored — live/<uuid>
+     * copies of recordings accumulated on the share. Listing everything first and
+     * then deleting it works on every filesystem; a couple of extra passes cover
+     * anything a slow network share still reports afterwards.
+     */
+    public function deleteTempDirectory(string $disk, string $dir): int
+    {
+        $storage = Storage::disk($disk);
+
+        for ($pass = 1; $pass <= 3 && $storage->directoryExists($dir); $pass++) {
+            foreach ($storage->allFiles($dir) as $file) {
+                $storage->delete($file);
+            }
+            foreach (array_reverse($storage->allDirectories($dir)) as $subDir) {
+                $storage->deleteDirectory($subDir);
+            }
+            $storage->deleteDirectory($dir);
+        }
+
+        if (! $storage->directoryExists($dir)) {
+            return 0;
+        }
+
+        return 1 + count($storage->allFiles($dir)) + count($storage->allDirectories($dir));
     }
 
     /**
